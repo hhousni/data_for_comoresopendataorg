@@ -1,0 +1,72 @@
+Subject: Re: Comoros data discrepancies — follow-up with exact queries and page references
+
+Dear IATI Support Team,
+
+Thank you for your response and for the pointer to the Datastore API. Following your request for more detail, here is a full breakdown with exact page references, API calls, and filters for each point.
+
+Reference page: https://d-portal.iatistandard.org/ctrack.html?country=KM#view=main (checked 2026-03-23)
+API used: https://d-portal.org/q.json (SQL interface)
+
+---
+
+1. TOTAL SPEND — resolved
+
+The $7,041,747,000 figure we initially referenced no longer appears on the page (likely updated since our first email). We now understand that d-portal's country view shows 1,016 activities — activities where Comoros is the sole recipient country. Our script fetches 1,273 activities because we also include the 257 multinational activities where KM appears alongside other recipient countries.
+
+When we filter to non-multinational activities only (matching d-portal's 1,016 perimeter), our spend figure is $1,726,470,646. This point is now understood on our end.
+
+---
+
+2. ACTIVITY STATUS COUNT — resolved ✅
+
+Once we apply the same non-multinational filter, our counts match d-portal exactly:
+
+SELECT act.status_code, COUNT(DISTINCT act.aid)
+FROM act
+JOIN country ON country.aid = act.aid
+WHERE country.country_code = 'KM'
+  AND (SELECT COUNT(*) FROM country c2 WHERE c2.aid = act.aid) = 1
+GROUP BY act.status_code
+
+Results: Implementation 332, Closed 355, Finalisation 246, Pipeline 76, Cancelled 1 — identical to d-portal. ✅
+
+---
+
+3. SECTOR 12110 COUNT — resolved ✅
+
+SELECT COUNT(DISTINCT act.aid)
+FROM act
+JOIN country ON country.aid = act.aid
+JOIN sector ON sector.aid = act.aid
+WHERE country.country_code = 'KM'
+  AND (SELECT COUNT(*) FROM country c2 WHERE c2.aid = act.aid) = 1
+  AND sector.sector_code = '12110'
+
+This gives 112 distinct activities. The figure of 119 shown on d-portal appears to count sector entries rather than distinct activities. We assume this is expected behaviour — please confirm if possible.
+
+---
+
+4. FINANCIAL AMOUNTS — still unresolved ❓
+
+This is our main remaining question. After applying the same 1,016 non-multinational activity filter, our commitment transactions (type C) total $2,430,662,935, compared to $1,785,149,942 shown in d-portal's "Where does the money come from?" section — a gap of ~$645M (+36%).
+
+Our query:
+
+SELECT SUM(t.transaction_value_usd)
+FROM act
+JOIN country ON country.aid = act.aid
+JOIN transaction t ON t.aid = act.aid
+WHERE country.country_code = 'KM'
+  AND (SELECT COUNT(*) FROM country c2 WHERE c2.aid = act.aid) = 1
+  AND t.transaction_type = 'C'
+
+Could you clarify how d-portal calculates this summary figure? Specifically:
+- Is it summing transaction type C, or sourced from a budget/commitment field?
+- Is a "latest revision only" rule applied per activity to avoid double-counting budget revisions?
+- Are transactions from certain publisher types or reporting organisations excluded?
+
+We are preparing to publish this dataset on comoresopendata.org and want to ensure our figures are aligned with yours before doing so. Any clarification on point 4 would be greatly appreciated.
+
+Thank you again for your support.
+
+Kind regards

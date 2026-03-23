@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Outputs (large files — regenerate locally by running scripts)
+outputs/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
