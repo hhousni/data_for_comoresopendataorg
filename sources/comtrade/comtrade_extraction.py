@@ -31,7 +31,7 @@ import time
 # ---------------------------------------------------------
 COUNTRY_WITS  = "COM"
 OUTPUT_DIR    = Path(__file__).parent.parent.parent / "outputs"
-OUTPUT_FILE   = OUTPUT_DIR / "comores_commerce_detail.xlsx"
+OUTPUT_FILE   = OUTPUT_DIR / "flux_commerciaux_comores_exports_imports_par_section.xlsx"
 WITS_BASE     = "https://wits.worldbank.org/API/V1/SDMX/V21/datasource/tradestats-trade"
 ECB_URL       = "https://data-api.ecb.europa.eu/service/data/EXR/A.USD.EUR.SP00.A?format=jsondata&startPeriod=1990&endPeriod=2025"
 ECB_TIMEOUT   = 45
@@ -100,12 +100,12 @@ METADATA = [
      "Code ISO 3166-1 alpha-3 du pays partenaire (ex: FRA, IND, ARE)"),
     ("partenaire_pays",      "WITS/Comtrade",
      "Nom du pays partenaire en francais"),
-    ("valeur_usd_millions",  "WITS/Comtrade",
-     "Valeur du flux en millions de dollars USD courants. Source directe WITS/Comtrade."),
-    ("valeur_eur_millions",  "BCE / calcul",
-     "Valeur en millions d euros. Calcul : valeur_usd / taux_annuel_usd_eur (BCE, moyenne annuelle). Voir colonne taux_usd_eur."),
-    ("valeur_kmf_milliards", "Calcul",
-     "Valeur en milliards de francs comoriens (KMF). Calcul : valeur_eur_millions x 491.968 / 1000. Taux fixe officiel : 1 EUR = 491.968 KMF."),
+    ("valeur_usd",          "WITS/Comtrade",
+     "Valeur du flux en dollars USD courants (valeur exacte). Source directe WITS/Comtrade (donnee originale en milliers USD multipliee par 1000)."),
+    ("valeur_eur",          "BCE / calcul",
+     "Valeur en euros courants (valeur exacte). Calcul : valeur_usd / taux_annuel_usd_eur (BCE, moyenne annuelle). Voir colonne taux_usd_eur."),
+    ("valeur_kmf",          "Calcul",
+     "Valeur en francs comoriens KMF (valeur exacte). Calcul : valeur_eur x 491.968. Taux fixe officiel inchange : 1 EUR = 491.968 KMF."),
     ("taux_usd_eur",         "BCE - EXR",
      "Taux de change annuel moyen USD/EUR utilise pour la conversion. Source : Banque Centrale Europeenne, serie EXR A.USD.EUR.SP00.A."),
     ("reporter_code",        "WITS/Comtrade",
@@ -221,11 +221,11 @@ def collect_trade(flow, ecb_rates):
             if val_usd_thousands == 0:
                 continue
 
-            annee       = int(r.get("TIME_PERIOD", 0))
-            val_usd_mln = round(val_usd_thousands / 1000, 6)
-            taux        = ecb_rates.get(annee)
-            val_eur_mln = round(val_usd_mln / taux, 6)         if taux else None
-            val_kmf_mld = round(val_eur_mln * KMF_PER_EUR / 1000, 6) if val_eur_mln is not None else None
+            annee   = int(r.get("TIME_PERIOD", 0))
+            val_usd = round(val_usd_thousands * 1000, 2)
+            taux    = ecb_rates.get(annee)
+            val_eur = round(val_usd / taux, 2) if taux else None
+            val_kmf = round(val_eur * KMF_PER_EUR, 0) if val_eur is not None else None
 
             rows.append({
                 "annee"               : annee,
@@ -234,9 +234,9 @@ def collect_trade(flow, ecb_rates):
                 "section_libelle"     : HS_SECTION_LABELS.get(section_code, section_code),
                 "partenaire_code_iso3": partner,
                 "partenaire_pays"     : PARTNER_LABELS.get(partner, partner),
-                "valeur_usd_millions" : val_usd_mln,
-                "valeur_eur_millions" : val_eur_mln,
-                "valeur_kmf_milliards": val_kmf_mld,
+                "valeur_usd"          : val_usd,
+                "valeur_eur"          : val_eur,
+                "valeur_kmf"          : val_kmf,
                 "taux_usd_eur"        : taux,
                 "reporter_code"       : "COM",
                 "reporter_pays"       : "Union des Comores",
@@ -260,9 +260,9 @@ def write_excel(df, output_path):
         "section_libelle"     : 46,
         "partenaire_code_iso3": 20,
         "partenaire_pays"     : 28,
-        "valeur_usd_millions" : 20,
-        "valeur_eur_millions" : 20,
-        "valeur_kmf_milliards": 22,
+        "valeur_usd"          : 20,
+        "valeur_eur"          : 20,
+        "valeur_kmf"          : 22,
         "taux_usd_eur"        : 14,
         "reporter_code"       : 16,
         "reporter_pays"       : 24,
