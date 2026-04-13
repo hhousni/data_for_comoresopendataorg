@@ -39,12 +39,10 @@ activities_en = pd.DataFrame(query(f"""
     SELECT act.aid, act.reporting, act.reporting_ref, act.funder_ref,
            act.title, act.description, act.slug, act.status_code,
            act.day_start, act.day_end, act.day_length,
-           act.commitment, act.spend, act.commitment_eur, act.spend_eur,
            country.country_code, country.country_percent
     FROM act
     JOIN country ON country.aid = act.aid
     WHERE country.country_code = '{COUNTRY_CODE}'
-    LIMIT 5000
 """))
 
 # French version
@@ -69,8 +67,14 @@ time.sleep(0.5)
 
 
 # ── Activité multinationale ───────────────────────────────────────────────
+activities["country_percent"] = pd.to_numeric(activities["country_percent"], errors="coerce").fillna(100)
+
+# Exclude activities with 0% allocation — they have no real Comoros share
+activities = activities[activities["country_percent"] > 0].copy()
+print(f"  -> {len(activities)} activités après exclusion des country_percent = 0")
+
 activities["activite_multinationale"] = activities["country_percent"].apply(
-    lambda x: "Non" if pd.to_numeric(x, errors="coerce") == 100 else "Oui"
+    lambda x: "Non" if x == 100 else "Oui"
 )
 
 # ── Status labels (French) ────────────────────────────────────────────────
@@ -192,11 +196,6 @@ for col, new_col in [("day_start", "date_debut"), ("day_end", "date_fin")]:
                         unit="D", origin="1970-01-01")
     activities[new_col] = dt.dt.strftime("%Y-%m-%d")
 
-# ── KMF conversion ────────────────────────────────────────────────────────
-activities["commitment_eur"] = pd.to_numeric(activities["commitment_eur"], errors="coerce")
-activities["spend_eur"]      = pd.to_numeric(activities["spend_eur"],      errors="coerce")
-activities["engagement_kmf"] = activities["commitment_eur"] * KMF_RATE
-activities["depense_kmf"]    = activities["spend_eur"]      * KMF_RATE
 
 # ── Activity URL ──────────────────────────────────────────────────────────
 activities["url_activite"] = "https://d-portal.org/ctrack.html?slug=" + activities["slug"].astype(str) + "#view=act"
@@ -372,31 +371,56 @@ bud_agg = budgets.groupby("aid").agg(
 ).reset_index()
 
 print("Récupération des transactions (par lots) ...")
+# Fetch transactions directly by KM aid list — no JOIN to country, so no row multiplication
+km_aids = activities["aid"].dropna().unique().tolist()
+# Build batched IN clauses to stay within query limits
+AID_BATCH = 200
 BATCH_SIZE = 50000
-offset = 0
 trans_batches = []
 
-while True:
-    batch = query(f"""
-        SELECT act.aid, t.trans_usd, t.trans_value, t.trans_currency,
-               t.trans_code, t.trans_flow_code, t.trans_finance_code
-        FROM act
-        JOIN country ON country.aid = act.aid
-        JOIN trans t ON t.aid = act.aid
-        WHERE country.country_code = '{COUNTRY_CODE}'
-        LIMIT {BATCH_SIZE} OFFSET {offset}
-    """)
-    if not batch:
-        break
-    trans_batches.append(pd.DataFrame(batch))
-    print(f"  -> Lot {offset // BATCH_SIZE + 1}: {len(batch)} transactions récupérées")
-    offset += BATCH_SIZE
-    if len(batch) < BATCH_SIZE:
-        break
-    time.sleep(0.5)
+for i in range(0, len(km_aids), AID_BATCH):
+    aids_chunk = km_aids[i:i + AID_BATCH]
+    ids_sql = ", ".join(f"'{a}'" for a in aids_chunk)
+    offset = 0
+    while True:
+        batch = query(f"""
+            SELECT t.aid, t.trans_day, t.trans_usd, t.trans_eur, t.trans_value, t.trans_currency,
+                   t.trans_code, t.trans_flow_code, t.trans_finance_code
+            FROM trans AS t
+            WHERE t.aid IN ({ids_sql})
+            LIMIT {BATCH_SIZE} OFFSET {offset}
+        """)
+        if not batch:
+            break
+        trans_batches.append(pd.DataFrame(batch))
+        offset += BATCH_SIZE
+        if len(batch) < BATCH_SIZE:
+            break
+    time.sleep(0.1)
+
+total_fetched = sum(len(b) for b in trans_batches)
+print(f"  -> {total_fetched} transactions récupérées")
 
 transactions = pd.concat(trans_batches, ignore_index=True) if trans_batches else pd.DataFrame()
-print(f"  -> {len(transactions)} transactions au total")
+
+if not transactions.empty:
+    # Join country_percent from activities (already fetched, no duplication risk)
+    pct = activities[["aid", "country_percent"]].drop_duplicates("aid")
+    transactions = transactions.merge(pct, on="aid", how="left")
+
+    # Adjust transaction amounts by country percentage for multi-country projects
+    transactions['trans_usd'] = pd.to_numeric(transactions['trans_usd'], errors='coerce').fillna(0)
+    transactions['trans_eur'] = pd.to_numeric(transactions['trans_eur'], errors='coerce').fillna(0)
+    transactions['country_percent'] = pd.to_numeric(transactions['country_percent'], errors='coerce').fillna(100)
+
+    transactions['trans_usd'] = transactions['trans_usd'] * (transactions['country_percent'] / 100)
+    transactions['trans_eur'] = transactions['trans_eur'] * (transactions['country_percent'] / 100)
+    transactions['trans_kmf'] = transactions['trans_eur'] * KMF_RATE
+
+    print(f"  -> {len(transactions)} transactions au total (montants ajustés pour les projets multi-pays)")
+else:
+    print("  -> Aucune transaction trouvée.")
+
 time.sleep(0.5)
 
 # Flow type labels (French)
@@ -442,7 +466,14 @@ def classify_instrument(codes_str):
     else:                    return "Autre"
 
 # Calcul sûr des sommes D/E/C (évite désalignement d'index dans groupby lambda)
-_d = transactions[transactions["trans_code"] == "D"].groupby("aid")["trans_usd"].sum().reset_index(name="total_decaissement_usd")
+# D (Disbursement) + E (Expenditure) combined — matches d-portal methodology
+disbursements = transactions[transactions["trans_code"].isin(["D", "E"])]
+_d = disbursements.groupby("aid").agg(
+    total_decaissement_usd=("trans_usd", "sum"),
+    total_decaissement_eur=("trans_eur", "sum"),
+    total_decaissement_kmf=("trans_kmf", "sum")
+).reset_index()
+
 _e = transactions[transactions["trans_code"] == "E"].groupby("aid")["trans_usd"].sum().reset_index(name="total_depense_usd")
 _c = transactions[transactions["trans_code"] == "C"].groupby("aid")["trans_usd"].sum().reset_index(name="total_engagement_usd")
 
@@ -459,8 +490,8 @@ trans_agg = (trans_agg
     .merge(_e, on="aid", how="left")
     .merge(_c, on="aid", how="left")
 )
-trans_agg[["total_decaissement_usd", "total_depense_usd", "total_engagement_usd"]] = \
-    trans_agg[["total_decaissement_usd", "total_depense_usd", "total_engagement_usd"]].fillna(0)
+trans_agg[["total_decaissement_usd", "total_decaissement_eur", "total_decaissement_kmf", "total_depense_usd", "total_engagement_usd"]] = \
+    trans_agg[["total_decaissement_usd", "total_decaissement_eur", "total_decaissement_kmf", "total_depense_usd", "total_engagement_usd"]].fillna(0)
 
 trans_agg["instrument_financement"] = trans_agg["codes_financement"].apply(classify_instrument)
 
@@ -494,32 +525,36 @@ dataset = (
 
 # ── Rename all columns to French ──────────────────────────────────────────
 dataset = dataset.rename(columns={
-    "aid":             "identifiant",
-    "reporting":       "organisation_rapporteur",
-    "reporting_ref":   "reference_rapporteur",
-    "funder_ref":      "reference_bailleur",
-    "title":           "titre",
-    "description":     "description",
-    "slug":            "slug",
-    "status_code":     "code_statut",
-    "statut_label":    "statut",
-    "day_start":       "jour_debut",
-    "day_end":         "jour_fin",
-    "day_length":      "duree_jours",
-    "date_debut":      "date_debut",
-    "date_fin":        "date_fin",
-    "commitment":      "engagement_usd",
-    "spend":           "depense_usd",
-    "commitment_eur":  "engagement_eur",
-    "spend_eur":       "depense_eur",
-    "engagement_kmf":  "engagement_kmf",
-    "depense_kmf":     "depense_kmf",
-    "country_code":    "code_pays",
-    "country_percent": "pourcentage_pays",
-    "type_bailleur":   "type_bailleur",
-    "pays_bailleur":   "pays_bailleur",
-    "region_bailleur": "region_bailleur",
-    "url_activite":    "url_activite",
+    "aid":                    "id_projet",
+    "reporting":              "bailleur_de_fonds",
+    "reporting_ref":          "reference_rapporteur",
+    "funder_ref":             "reference_bailleur",
+    "title":                  "titre",
+    "description":            "description",
+    "slug":                   "slug",
+    "status_code":            "code_statut",
+    "statut_label":           "statut",
+    "day_start":              "jour_debut",
+    "day_end":                "jour_fin",
+    "day_length":             "duree_jours",
+    "date_debut":             "date_debut",
+    "date_fin":               "date_fin",
+    "country_code":           "code_pays",
+    "country_percent":        "pourcentage_pays",
+    "type_bailleur":          "type_bailleur",
+    "pays_bailleur":          "pays_bailleur",
+    "region_bailleur":        "region_bailleur",
+    "url_activite":           "lien_source",
+    "activite_multinationale": "projet_multi_pays",
+    "total_decaissement_usd": "montant_verse_usd",
+    "total_decaissement_eur": "montant_verse_eur",
+    "total_decaissement_kmf": "montant_verse_kmf",
+    "total_engagement_usd":   "engagement_transactions_usd",
+    "total_depense_usd":      "depense_transactions_usd",
+    "noms_localisation":      "localisation",
+    "budget_usd":             "budget_prevu_usd",
+    "budget_eur":             "budget_prevu_eur",
+    "budget_kmf":             "budget_prevu_kmf",
 })
 
 # Clean numeric columns
@@ -531,40 +566,8 @@ for col in ["engagement_usd", "depense_usd", "engagement_eur", "depense_eur",
 
 
 # ── Remove duplicates ────────────────────────────────────────────────────
-dataset = dataset.drop_duplicates(subset="identifiant", keep="first")
+dataset = dataset.drop_duplicates(subset="id_projet", keep="first")
 print(f"  -> {len(dataset)} activités après dédoublonnage")
-
-# ── Reorder columns ───────────────────────────────────────────────────────
-column_order = [
-    # 1. Identification
-    "identifiant", "titre", "description", "url_activite",
-    # 2. Statut et dates
-    "code_statut", "statut", "date_debut", "date_fin", "duree_jours",
-    # 3. Bailleur
-    "organisation_rapporteur", "reference_rapporteur", "reference_bailleur",
-    "type_bailleur", "pays_bailleur", "region_bailleur",
-    # 4. Engagements et dépenses
-    "engagement_usd", "engagement_eur", "engagement_kmf",
-    "depense_usd", "depense_eur", "depense_kmf",
-    # 5. Budget
-    "budget_valeur_originale", "budget_devise_originale",
-    "budget_usd", "budget_eur", "budget_kmf",
-    # 6. Transactions
-    "instrument_financement", "labels_flux", "labels_financement",
-    "total_engagement_usd", "total_decaissement_usd", "total_depense_usd",
-    "nombre_transactions",
-    # 7. Secteurs
-    "labels_groupe_secteur", "labels_secteur", "groupes_secteur", "codes_secteur",
-    # 8. Localisation
-    "noms_localisation", "latitudes", "longitudes",
-    # 9. Technique
-    "code_pays", "pourcentage_pays", "activite_multinationale", "slug", "jour_debut", "jour_fin",
-    "indicateurs", "codes_flux", "codes_financement",
-]
-
-# Only keep columns that exist in the dataset
-column_order = [c for c in column_order if c in dataset.columns]
-dataset = dataset[column_order]
 
 
 # ── Combiner codes et labels en une seule colonne ─────────────────────────
@@ -575,6 +578,9 @@ def combine_code_label(codes_str, labels_str):
         return None
     codes  = [c.strip() for c in str(codes_str).split(",")]
     labels = [l.strip() for l in str(labels_str).split(",")]
+    # Handle cases where there's a mismatch
+    if len(codes) != len(labels):
+        return labels_str
     combined = [f"{c}_{l}" for c, l in zip(codes, labels)]
     return ", ".join(combined)
 
@@ -586,125 +592,145 @@ dataset["statut"] = dataset.apply(
 )
 
 # Secteurs
-dataset["secteurs"] = dataset.apply(
-    lambda r: combine_code_label(r["codes_secteur"], r["labels_secteur"]), axis=1
-)
+dataset["secteur_detail"] = dataset["labels_secteur"]
 
 # Groupes secteur
-dataset["groupes_secteur"] = dataset.apply(
-    lambda r: combine_code_label(r["groupes_secteur"], r["labels_groupe_secteur"]), axis=1
-)
+dataset["secteur_principal"] = dataset["labels_groupe_secteur"]
 
 # Flux
-dataset["flux"] = dataset.apply(
-    lambda r: combine_code_label(r["codes_flux"], r["labels_flux"]), axis=1
-)
+dataset["flux"] = dataset["labels_flux"]
 
 # Financement
-dataset["financement"] = dataset.apply(
-    lambda r: combine_code_label(r["codes_financement"], r["labels_financement"]), axis=1
-)
+dataset["financement"] = dataset["labels_financement"]
+
 
 # Drop redundant columns
-dataset = dataset.drop(columns=[
-    "code_statut",
-    "codes_secteur", "labels_secteur",
-    "labels_groupe_secteur",
-    "codes_flux", "labels_flux",
-    "codes_financement", "labels_financement",
-    "slug", "jour_debut", "jour_fin",
-    "reference_bailleur", "code_pays",
-    "pourcentage_pays",
-])
-
-# Rename columns for clarity
-dataset = dataset.rename(columns={
-    "total_engagement_usd"   : "engagement_transactions_usd",
-    "total_decaissement_usd" : "decaissement_transactions_usd",
-    "total_depense_usd"      : "depense_transactions_usd",
-    "reference_rapporteur"   : "id_bailleur",
-    "duree_jours"            : "duree_projet_jours",
-    "noms_localisation"      : "localisation",
-})
+columns_to_drop = [
+    "code_statut", "codes_secteur", "labels_secteur", "labels_groupe_secteur",
+    "codes_flux", "labels_flux", "codes_financement", "labels_financement",
+    "slug", "jour_debut", "jour_fin", "reference_bailleur", "code_pays",
+    "pourcentage_pays", "flux", "financement"
+]
+dataset = dataset.drop(columns=[col for col in columns_to_drop if col in dataset.columns])
 
 
-dataset = dataset[[
+
+# ── Reorder columns ───────────────────────────────────────────────────────
+final_column_order = [
     # 1. Identification
-    "identifiant", "titre", "description", "url_activite",
+    "id_projet", "titre", "description", "lien_source",
     # 2. Statut et dates
-    "statut", "date_debut", "date_fin", "duree_projet_jours",
+    "statut", "date_debut", "date_fin",
     # 3. Bailleur
-    "organisation_rapporteur", "id_bailleur",
+    "bailleur_de_fonds",
     "type_bailleur", "pays_bailleur", "region_bailleur",
-    # 4. Engagements et dépenses
-    "engagement_usd", "engagement_eur", "engagement_kmf",
-    "depense_usd", "depense_eur", "depense_kmf",
-    # 5. Budget
-    "budget_valeur_originale", "budget_devise_originale",
-    "budget_usd", "budget_eur", "budget_kmf",
-    # 6. Transactions
-    "instrument_financement", "flux", "financement",
-    "engagement_transactions_usd", "decaissement_transactions_usd",
-    "depense_transactions_usd", "nombre_transactions",
+    # 4. Financement
+    "instrument_financement",
+    # 5. Montants versés (argent effectivement décaissé)
+    "montant_verse_usd", "montant_verse_eur", "montant_verse_kmf",
+    # 6. Budget prévu
+    "budget_prevu_usd", "budget_prevu_eur", "budget_prevu_kmf",
     # 7. Secteurs
-    "groupes_secteur", "secteurs",
+    "secteur_principal", "secteur_detail",
     # 8. Localisation
     "localisation", "latitudes", "longitudes",
-    # 9. Technique
-    "activite_multinationale",
-]]
+    # 9. Contexte
+    "projet_multi_pays",
+]
+# Ensure all columns in the final list exist in the dataset before selection
+final_column_order_existing = [col for col in final_column_order if col in dataset.columns]
+final_dataset = dataset[final_column_order_existing]
 
+
+# ── d-portal Analysis ─────────────────────────────────────────────────────
+print("\nAnalyse des décaissements par bailleur (similaire à d-portal)...")
+
+# Convert trans_day to datetime, coercing errors
+transactions['trans_day'] = pd.to_datetime(transactions['trans_day'], errors='coerce')
+
+# Filter for disbursements+expenditures (D+E, matching d-portal methodology) and valid dates
+disbursements = transactions[
+    (transactions['trans_code'].isin(['D', 'E'])) & 
+    (transactions['trans_day'].notna())
+].copy()
+
+# Merge with activities to get funder information
+disbursements_with_funders = disbursements.merge(
+    final_dataset[['id_projet', 'pays_bailleur', 'type_bailleur', 'region_bailleur', 'bailleur_de_fonds']],
+    left_on='aid',
+    right_on='id_projet',
+    how='left'
+)
+
+# Group by funder and sum disbursements
+funder_summary = disbursements_with_funders.groupby(
+    ['region_bailleur', 'pays_bailleur', 'type_bailleur']
+).agg(
+    total_usd=('trans_usd', 'sum'),
+    total_eur=('trans_eur', 'sum'),
+    total_kmf=('trans_kmf', 'sum')
+).reset_index()
+
+# Sort and format for display
+funder_summary = funder_summary.sort_values(by='total_usd', ascending=False)
+funder_summary['Total Décaissements (USD)'] = funder_summary['total_usd'].map("${:,.0f}".format)
+funder_summary['Total Décaissements (EUR)'] = funder_summary['total_eur'].map("€{:,.0f}".format)
+funder_summary['Total Décaissements (KMF)'] = funder_summary['total_kmf'].map("{:,.0f} KMF".format)
+funder_summary = funder_summary.drop(columns=['total_usd', 'total_eur', 'total_kmf'])
+
+
+print(funder_summary.to_string(index=False))
+grand_total_usd = disbursements_with_funders['trans_usd'].sum()
+grand_total_eur = disbursements_with_funders['trans_eur'].sum()
+grand_total_kmf = disbursements_with_funders['trans_kmf'].sum()
+print(f"\nTotal Général des Décaisseements: ${grand_total_usd:,.0f} USD | €{grand_total_eur:,.0f} EUR | {grand_total_kmf:,.0f} KMF")
 
 metadata = pd.DataFrame([
-    # 1. Identification
-    {"colonne": "identifiant",                  "source": "IATI",    "description": "Identifiant unique de l'activité dans le système IATI"},
-    {"colonne": "titre",                        "source": "IATI",    "description": "Titre de l'activité (français si disponible, anglais sinon)"},
-    {"colonne": "description",                  "source": "IATI",    "description": "Description détaillée de l'activité (français si disponible, anglais sinon)"},
-    {"colonne": "url_activite",                 "source": "Calculé", "description": "Lien vers la fiche complète de l'activité sur d-portal.org"},
-    # 2. Statut et dates
-    {"colonne": "statut",                       "source": "IATI",    "description": "Statut de l'activité au format code_label (ex: 2_En cours). Codes: 1_Identification, 2_En cours, 3_Finalisation, 4_Clôturé, 5_Annulé, 6_Suspendu"},
-    {"colonne": "date_debut",                   "source": "Calculé", "description": "Date de début de l'activité au format YYYY-MM-DD (convertie depuis le format numérique IATI)"},
-    {"colonne": "date_fin",                     "source": "Calculé", "description": "Date de fin de l'activité au format YYYY-MM-DD (convertie depuis le format numérique IATI)"},
-    {"colonne": "duree_projet_jours",           "source": "IATI",    "description": "Durée totale du projet en jours"},
-    # 3. Bailleur
-    {"colonne": "organisation_rapporteur",      "source": "IATI",    "description": "Nom de l'organisation qui publie les données IATI pour cette activité"},
-    {"colonne": "id_bailleur",                  "source": "IATI",    "description": "Identifiant de référence de l'organisation rapporteur dans le registre IATI"},
-    {"colonne": "type_bailleur",                "source": "Calculé", "description": "Type de bailleur calculé à partir de l'identifiant et du nom: Bilatéral, Multilatéral, ONG, Autre"},
-    {"colonne": "pays_bailleur",                "source": "Calculé", "description": "Pays d'origine du bailleur (ex: France, États-Unis). Multilatéral si organisation internationale"},
-    {"colonne": "region_bailleur",              "source": "Calculé", "description": "Région d'origine du bailleur: Europe, Amérique du Nord, Asie Pacifique, Monde Arabe, Afrique, Multilatéral, ONG, Autre"},
-    # 4. Engagements et dépenses
-    {"colonne": "engagement_usd",               "source": "IATI",    "description": "Montant total engagé en Dollars américains (USD)"},
-    {"colonne": "engagement_eur",               "source": "IATI",    "description": "Montant total engagé en Euros (EUR)"},
-    {"colonne": "engagement_kmf",               "source": "Calculé", "description": "Montant total engagé en Francs comoriens (KMF), calculé via la parité fixe: 1 EUR = 491.96775 KMF"},
-    {"colonne": "depense_usd",                  "source": "IATI",    "description": "Montant total dépensé en Dollars américains (USD)"},
-    {"colonne": "depense_eur",                  "source": "IATI",    "description": "Montant total dépensé en Euros (EUR)"},
-    {"colonne": "depense_kmf",                  "source": "Calculé", "description": "Montant total dépensé en Francs comoriens (KMF), calculé via la parité fixe: 1 EUR = 491.96775 KMF"},
-    # 5. Budget
-    {"colonne": "budget_valeur_originale",      "source": "IATI",    "description": "Montant total du budget dans la devise originale rapportée par le bailleur"},
-    {"colonne": "budget_devise_originale",      "source": "IATI",    "description": "Devise originale du budget (ex: USD, EUR, GBP)"},
-    {"colonne": "budget_usd",                   "source": "IATI",    "description": "Montant total du budget converti en Dollars américains (USD)"},
-    {"colonne": "budget_eur",                   "source": "IATI",    "description": "Montant total du budget converti en Euros (EUR)"},
-    {"colonne": "budget_kmf",                   "source": "Calculé", "description": "Montant total du budget en Francs comoriens (KMF), calculé via la parité fixe: 1 EUR = 491.96775 KMF"},
-    # 6. Transactions
-    {"colonne": "instrument_financement",       "source": "Calculé", "description": "Type simplifié de financement calculé à partir des codes de finance IATI: Don, Prêt, Mixte, Autre, Inconnu"},
-    {"colonne": "flux",                         "source": "Calculé", "description": "Type de flux financier au format code_label (ex: 10_APD). Basé sur le code IATI trans_flow_code"},
-    {"colonne": "financement",                  "source": "Calculé", "description": "Type de financement au format code_label (ex: 110_Don standard). Basé sur le code IATI trans_finance_code"},
-    {"colonne": "engagement_transactions_usd",  "source": "IATI",    "description": "Montant total des transactions de type Engagement (C) en USD, calculé depuis la table des transactions"},
-    {"colonne": "decaissement_transactions_usd","source": "IATI",    "description": "Montant total des transactions de type Décaissement (D) en USD — argent versé au destinataire"},
-    {"colonne": "depense_transactions_usd",     "source": "IATI",    "description": "Montant total des transactions de type Dépense (E) en USD — argent effectivement dépensé sur le terrain"},
-    {"colonne": "nombre_transactions",          "source": "IATI",    "description": "Nombre total de transactions financières enregistrées pour cette activité"},
-    # 7. Secteurs
-    {"colonne": "groupes_secteur",              "source": "Calculé", "description": "Groupes sectoriels au format code_label (ex: 121_Santé générale). Basé sur la classification OCDE CAD 3 chiffres"},
-    {"colonne": "secteurs",                     "source": "Calculé", "description": "Secteurs au format code_label (ex: 12110_Politique sanitaire). Basé sur la classification OCDE CAD 5 chiffres"},
-    # 8. Localisation
-    {"colonne": "localisation",                 "source": "IATI",    "description": "Noms des lieux d'intervention de l'activité (peut contenir plusieurs valeurs séparées par des virgules)"},
-    {"colonne": "latitudes",                    "source": "IATI",    "description": "Coordonnées géographiques latitude des lieux d'intervention (peut contenir plusieurs valeurs)"},
-    {"colonne": "longitudes",                   "source": "IATI",    "description": "Coordonnées géographiques longitude des lieux d'intervention (peut contenir plusieurs valeurs)"},
-    # 9. Technique
-    {"colonne": "activite_multinationale",      "source": "Calculé", "description": "Indique si l'activité couvre plusieurs pays: Oui (Comores = partie du projet) ou Non (Comores = seul pays bénéficiaire)"},
+    {"colonne": "id_projet",          "source": "IATI",    "description": "Identifiant unique de l'activité dans le système IATI"},
+    {"colonne": "titre",               "source": "IATI",    "description": "Titre de l'activité (français si disponible, anglais sinon)"},
+    {"colonne": "description",         "source": "IATI",    "description": "Description détaillée de l'activité"},
+    {"colonne": "lien_source",         "source": "Calculé", "description": "Lien vers la fiche complète de l'activité sur d-portal.org"},
+    {"colonne": "statut",              "source": "IATI",    "description": "Statut du projet: 1=Identification, 2=En cours, 3=Finalisation, 4=Clôturé, 5=Annulé, 6=Suspendu"},
+    {"colonne": "date_debut",          "source": "IATI",    "description": "Date de début du projet (format YYYY-MM-DD)"},
+    {"colonne": "date_fin",            "source": "IATI",    "description": "Date de fin du projet (format YYYY-MM-DD)"},
+    {"colonne": "bailleur_de_fonds",   "source": "IATI",    "description": "Nom de l'organisation qui finance et publie les données (ex: Banque Mondiale, USAID, AFD)"},
+    {"colonne": "type_bailleur",       "source": "Calculé", "description": "Type de bailleur: Bilatéral (un pays), Multilatéral (organisation internationale), ONG, Autre"},
+    {"colonne": "pays_bailleur",       "source": "Calculé", "description": "Pays d'origine du bailleur (ex: France, États-Unis). 'Multilatéral' si organisation internationale"},
+    {"colonne": "region_bailleur",     "source": "Calculé", "description": "Région d'origine du bailleur: Europe, Amérique du Nord, Asie Pacifique, Monde Arabe, Multilatéral, ONG, Autre"},
+    {"colonne": "instrument_financement", "source": "Calculé", "description": "Type de financement: Don (argent non remboursable), Prêt (argent à rembourser), Mixte, Autre"},
+    {"colonne": "montant_verse_usd",   "source": "IATI",    "description": "Argent effectivement versé aux Comores en Dollars américains (USD). Pour les projets multi-pays, seule la part destinée aux Comores est comptabilisée"},
+    {"colonne": "montant_verse_eur",   "source": "IATI",    "description": "Argent effectivement versé aux Comores en Euros (EUR)"},
+    {"colonne": "montant_verse_kmf",   "source": "Calculé", "description": "Argent effectivement versé aux Comores en Francs comoriens (KMF). Parité fixe: 1 EUR = 491.96775 KMF"},
+    {"colonne": "budget_prevu_usd",    "source": "IATI",    "description": "Budget total prévu (pas encore nécessairement versé) en Dollars américains (USD)"},
+    {"colonne": "budget_prevu_eur",    "source": "IATI",    "description": "Budget total prévu en Euros (EUR)"},
+    {"colonne": "budget_prevu_kmf",    "source": "Calculé", "description": "Budget total prévu en Francs comoriens (KMF). Parité fixe: 1 EUR = 491.96775 KMF"},
+    {"colonne": "secteur_principal",   "source": "Calculé", "description": "Grand secteur d'intervention (ex: Santé générale, Éducation de base). Classification OCDE CAD 3 chiffres"},
+    {"colonne": "secteur_detail",      "source": "Calculé", "description": "Sous-secteur détaillé (ex: Soins de santé de base, Enseignement primaire). Classification OCDE CAD 5 chiffres"},
+    {"colonne": "localisation",        "source": "IATI",    "description": "Zones géographiques d'intervention déclarées par le bailleur (île, ville, région)"},
+    {"colonne": "latitudes",           "source": "IATI",    "description": "Coordonnées latitude des lieux d'intervention (utilisées pour la cartographie)"},
+    {"colonne": "longitudes",          "source": "IATI",    "description": "Coordonnées longitude des lieux d'intervention (utilisées pour la cartographie)"},
+    {"colonne": "projet_multi_pays",   "source": "Calculé", "description": "Oui = les Comores font partie d'un projet régional/mondial (montant ajusté en conséquence). Non = projet dédié uniquement aux Comores"},
 ])
 
+# ── Write Excel file ──────────────────────────────────────────────────────
+import os
+os.makedirs("outputs", exist_ok=True)
+output_file = "outputs/comores_aide_internationale_v2.xlsx"
 
-with pd.ExcelWriter("backend/app/data_extraction/data/iati/comores_aide_internationale.xlsx", engine="openpyxl") as writer:
-    dataset.to_excel(writer, sheet_name="Données", index=False)
+with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+    final_dataset.to_excel(writer, sheet_name="Données", index=False)
     metadata.to_excel(writer, sheet_name="Métadonnées", index=False)
+
+    workbook  = writer.book
+    header_fmt = workbook.add_format({
+        "bold": True, "text_wrap": True, "valign": "top",
+        "fg_color": "#D7E4BC", "border": 1
+    })
+    for sheet_name, df in [("Données", final_dataset), ("Métadonnées", metadata)]:
+        ws = writer.sheets[sheet_name]
+        for col_num, value in enumerate(df.columns):
+            ws.write(0, col_num, value, header_fmt)
+
+print(f"\nFichier Excel créé : {output_file}")
+print("Colonnes exportées :", final_dataset.columns.tolist())
+
